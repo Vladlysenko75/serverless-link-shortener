@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "properties": {
+    "link": { "type": "string" },
+    "expiresIn": { "type": "string" }
+  },
+  "required": ["link", "expiresIn"]
+}

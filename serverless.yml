@@ -1,0 +1,290 @@
+service: link-shortener
+
+useDotenv: true
+
+provider:
+  name: aws
+  stackName: link-shortener
+  runtime: nodejs16.x
+  stage: ${opt:stage, 'dev'}
+  region: us-east-1
+  timeout: 30
+  memorySize: 256
+  apiGateway:
+    minimumCompressionSize: 1024
+    shouldStartNameWithService: true
+  environment:
+    REGION: ${self:provider.region}
+    STAGE: ${self:provider.stage}
+  iam:
+    role:
+      managedPolicies:
+        - arn:aws:iam::aws:policy/AmazonEventBridgeSchedulerFullAccess
+      statements:
+        - Effect: Allow
+          Action:
+            - lambda:InvokeFunction
+            - lambda:InvokeAsync
+          Resource: "*"
+        - Effect: Allow
+          Action:
+            - dynamodb:*
+            - events:PutEvents
+            - events:PutRule
+            - events:CreateRule
+          Resource: "*"
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource:
+            - arn:aws:sqs:${self:provider.region}:${env:AWS_ACCOUNT_ID}:sendNotificationQueue
+            - arn:aws:lambda:${self:provider.region}:${env:AWS_ACCOUNT_ID}:function:link-shortener-dev-disableLink
+        - Effect: Allow
+          Action:
+            - sts:*
+          Resource: arn:aws:iam::${env:AWS_ACCOUNT_ID}:role/scheduler-event-role
+        - Effect: Allow
+          Action:
+            - ses:SendEmail
+          Resource: arn:aws:ses:${self:provider.region}:${env:AWS_ACCOUNT_ID}:identity/${env:EMAIL}
+custom:
+  dotenv:
+    path: .env.${self:provider.stage}
+  scripts:
+    hooks:
+      "after:deploy:finalize": node --experimental-modules verifyEmail.mjs
+  esbuild:
+    bundle: true
+    minify: false
+    sourcemap: true
+    exclude: ["aws-sdk"]
+    target: "node18"
+    define:
+      "require.resolve": undefined
+    platform: "node"
+    concurrency: 10
+  autoswagger:
+    host: localhost:3000/dev/
+    typefiles: src/types/api-types.ts
+    apiKeyHeaders: ["Authorization"]
+    excludeStages: ["production"]
+  usersTableName: "users"
+  linksTableName: "links"
+  linksIndexName: "linksByUser"
+  usersIndexName: "usersByEmail"
+  dynamodb:
+    stages:
+      - dev
+    start:
+      port: 8000
+      inMemory: true
+      migrate: true
+  convertEmptyValues: true
+  "serverless-offline":
+    httpPort: 3000
+    babelOptions:
+      presets:
+        - env
+  # serverless-offline-sqs:
+  #   autoCreate: true
+  #   endpoint: ${env:SQS_ENDPOINT}
+  #   accessKeyId: ${env:AWS_ACCESS_KEY_ID}
+  #   secretAccessKey: ${env:AWS_SECRET_ACCESS_KEY}
+  #   region: ${self:provider.region}
+
+plugins:
+  - serverless-auto-swagger
+  - serverless-dotenv-plugin
+  - serverless-esbuild
+  - serverless-plugin-scripts
+  - serverless-offline
+  # - serverless-dynamodb-local
+  # - serverless-offline-sqs
+  # - serverless-offline-aws-eventbridge
+
+# package:
+#   individually: true
+#   exclude:
+#     - elasticMQ
+
+functions:
+  register:
+    handler: src/functions/register/handler.main
+    events:
+      - http:
+          method: post
+          path: /register
+          bodyType: User
+          request:
+            schemas:
+              application/json: ${file(src/functions/register/schema.json)}
+          responseData:
+            200:
+              bodyType: LoginResponse
+  login:
+    handler: src/functions/login/handler.main
+    events:
+      - http:
+          method: post
+          path: /login
+          bodyType: User
+          request:
+            schemas:
+              application/json: ${file(src/functions/register/schema.json)}
+          responseData:
+            200:
+              bodyType: LoginResponse
+  getLinks:
+    handler: src/functions/getLinks/handler.main
+    events:
+      - http:
+          method: get
+          path: /links
+          responseData:
+            200:
+              bodyType: LinksResponse
+  visitLink:
+    handler: src/functions/visitLink/handler.main
+    events:
+      - http:
+          method: get
+          path: /{linkHash}
+          responseData:
+            302:
+              description: Redirects to source url
+
+  createLink:
+    handler: src/functions/createLink/handler.main
+    events:
+      - http:
+          method: post
+          path: /link
+          bodyType: Link
+          request:
+            schemas:
+              application/json: ${file(src/functions/createLink/schema.json)}
+          responseData:
+            200:
+              bodyType: CreateLinkResponse
+  updateLink:
+    handler: src/functions/updateLink/handler.main
+    events:
+      - http:
+          method: patch
+          path: /link/{linkId}
+          bodyType: Active
+          request:
+            schemas:
+              application/json: ${file(src/functions/updateLink/schema.json)}
+          responseData:
+            200:
+              bodyType: UpdateLinkResponse
+  disableLink:
+    handler: src/functions/disableLink/handler.main
+    events:
+      - eventBridge:
+          eventBus: default
+          pattern:
+            source:
+              - "disabler"
+            detail-type:
+              - "link-disabler"
+  sendNotification:
+    handler: src/functions/sendNotification/handler.main
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - sendNotificationQueue
+              - Arn
+          batchSize: 10
+
+resources:
+  Resources:
+    MyEventBridgeSchedulerRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: scheduler-event-role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+                  - events.amazonaws.com
+                  - scheduler.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Policies:
+          - PolicyName: LambdaInvokeAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - lambda:InvokeFunction
+                  Resource:
+                    "*"
+                    # - "arn:aws:lambda:${self:provider.region}:${env:AWS_ACCOUNT_ID}:function:link-shortener-dev-disableLink:*"
+                    # - "arn:aws:lambda:${self:provider.region}:${env:AWS_ACCOUNT_ID}:function:link-shortener-dev-disableLink"
+    EventBridgeRule:
+      Type: AWS::Events::Rule
+      Properties:
+        EventPattern:
+          source:
+            - "disabler"
+          detail-type:
+            - "link-disabler"
+        Targets:
+          - Arn: arn:aws:lambda:${self:provider.region}:${env:AWS_ACCOUNT_ID}:function:disableLink
+            Id: MyListeningFunctionTarget
+    DisableLinkQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: DisableLinkQueue
+    sendNotificationQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: sendNotificationQueue
+    usersTable:
+      Type: "AWS::DynamoDB::Table"
+      Properties:
+        TableName: ${self:custom.usersTableName}
+        AttributeDefinitions:
+          - AttributeName: email
+            AttributeType: S
+        KeySchema:
+          - AttributeName: email
+            KeyType: HASH
+        ProvisionedThroughput:
+          ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+    linksTable:
+      Type: "AWS::DynamoDB::Table"
+      Properties:
+        TableName: ${self:custom.linksTableName}
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+          - AttributeName: userId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        ProvisionedThroughput:
+          ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        GlobalSecondaryIndexes:
+          - IndexName: UserIdIndex
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+            ProvisionedThroughput:
+              ReadCapacityUnits: 5
+              WriteCapacityUnits: 5
